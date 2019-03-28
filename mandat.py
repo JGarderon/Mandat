@@ -1,12 +1,24 @@
 import ssl 
 import asyncio 
+import sys 
+import configparser 
+import os 
 
 # Julien Garderon, mars 2019 
 # https://github.com/JGarderon/Mandat 
 # Fonctionnel à partir de Python 3.7 (mots-clé async/await) 
 
-PORT_entrant = 8443  
-PORT_sortant = 8000 
+Mandat_type = {
+	"port_entrant": int, 
+	"port_sortant" : int, 
+	"client_tls" : bool 
+} 
+
+Mandats_liaisons = {} 
+Mandats = [] 
+
+def log(*a, **b): 
+	print( *a, **b )  
 
 class Paire: 
 
@@ -16,11 +28,10 @@ class Paire:
 		self.service_r = None 
 		self.service_w = None 
 
-	async def desservir(self): 
-		global PORT_sortant 
+	async def desservir(self, port_sortant): 
 		self.service_r, self.service_w = await asyncio.open_connection( 
 			'127.0.0.1', 
-			PORT_sortant 
+			port_sortant 
 		) 
 
 	async def suivre(self, est_client): 
@@ -46,7 +57,8 @@ class Paire:
 async def accepter(client_r, client_w): 
 	try: 
 		obj_conn = Paire( client_r, client_w ) 
-		await obj_conn.desservir() 
+		port_entrant = obj_conn.client_w.get_extra_info('socket').getsockname()[1] 
+		await obj_conn.desservir( Mandats_liaisons[port_entrant] )  
 		obj_conn.tache_client = asyncio.create_task( 
 			obj_conn.suivre( True ) 
 		) 
@@ -57,28 +69,79 @@ async def accepter(client_r, client_w):
 		await obj_conn.tache_service 
 		await obj_conn.stopper() 
 	except ConnectionRefusedError as err: 
-		print("err 1", err) 
+		log( ">> err 1", err ) 
 		# si besoin de clôture le serveur de mandat ici ? 
 		writer.close() 
 
-async def lancer(ssl_contexte = None): 
-	global PORT_entrant 
-	if ssl_contexte is True: 
+async def lancer_individuellement(mandat): 
+	if mandat["client_tls"] is True: 
 		ssl_contexte = ssl.SSLContext( 
 			ssl.PROTOCOL_TLS_SERVER 
 		) 
 		ssl_contexte.load_cert_chain( 
-			'./server.pem' # à modifier évidemment... 
+			'./server.pem' 
 		) 
 		ssl_contexte.check_hostname = False 
-	serveur = await asyncio.start_server(
+	else: 
+		ssl_contexte = None 
+	log( 
+		">> lancement d'un mandat (port %s)" 
+		% mandat["port_entrant"] 
+	) 
+	return await asyncio.start_server(
 		accepter, 
 		'', 
-		PORT_entrant, 
+		mandat["port_entrant"], 
 		ssl = ssl_contexte 
 	) 
-	async with serveur:
-		await serveur.serve_forever()
 
-asyncio.run( lancer( True ) ) # n'hésitez pas à signaler tout dysfonctionnement ! 
+async def resoudre(): 
+	global Mandats 
+	while True: 
+		for mandat in Mandats: 
+			await mandat["serveur"].start_serving() 
+
+async def lancer(): 
+	global Mandats 
+	for cle, mandat in enumerate( Mandats ): 
+		serveur = await lancer_individuellement( mandat ) 
+		Mandats[cle]["serveur"] = serveur 
+		Mandats_liaisons[mandat["port_entrant"]] = mandat["port_sortant"] 
+	await resoudre() 
+
+def preparer(): 
+	global Mandats 
+	try: 
+		if len(sys.argv)<2: 
+			raise Exception( 
+				"vous devez indiquer un fichier "
+				+"de configuration"
+			) 
+		configuration_chemin = sys.argv[1] 
+		if not os.path.isfile( configuration_chemin ): 
+			raise Exception( 
+				"le fichier de configuration indiqué "
+				+"n'est pas accessible" 
+			) 
+		log( 
+			">> compréhension du fichier de configuration "
+			+"'%s'" % configuration_chemin 
+		)
+		configurateur = configparser.ConfigParser() 
+		configurateur.read( configuration_chemin ) 
+		_cherche = Mandat_type.keys() 
+		for mandat_nom in configurateur: 
+			if mandat_nom == "DEFAULT": 
+				continue 
+			set_mandat = set( configurateur.options(mandat_nom) ) 
+			Mandats.append( 
+				{item:Mandat_type[item]( configurateur.get( mandat_nom, item ) ) for item in _cherche if item in set_mandat} 
+			) 
+		asyncio.run( lancer() ) 
+	except Exception as err: 
+		log( "err 2", err ) 
+		pass 
+
+if __name__=="__main__": 
+	preparer() 
 
